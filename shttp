@@ -2,116 +2,17 @@
 
 // shttp - Node.js HTTP proxy server
 // Allows running commands from the PATH via HTTP with a whitelist
-//
-// Usage: node shttp
-//
+
 // Environment variables:
-//   SHTTP_PORT         Server port (default: 8080)
+//   SHTTP_ENDPOINT      Server endpoint (default: http://localhost:8080)
 //   SHTTP_ALLOWED_COMMANDS Whitelist of commands allowed (e.g., "git curl wget python")
-//
-// API:
-//   POST /
-//   Content-Type: text/plain (or any)
-//   Body: Raw command string "git commit -m \"msg\""
-//
-// Response:
-//   - Streams stdout from the executed command
-//   - Returns exit code via trailing "__EXIT_CODE__:N" marker
 
 const http = require('http');
-const { exec } = require('child_process');
+const { spawn } = require('child_process');
 
 // Configuration
-const PORT = process.env.SHTTP_PORT || 8080;
+const SHTTP_ENDPOINT = process.env.SHTTP_ENDPOINT || 'http://localhost:8080';
 const ALLOWED_COMMANDS_ENV = process.env.SHTTP_ALLOWED_COMMANDS || '';
-
-// Exit with non-zero code if whitelist is not configured (strict mode)
-if (ALLOWED_COMMANDS_ENV === '') {
-  console.error('Error: SHTTP_ALLOWED_COMMANDS is not configured. No commands will be allowed.');
-  process.exit(1);
-}
-
-// Parse whitelist into a Set (split by comma or whitespace)
-const allowedCommands = new Set(
-  ALLOWED_COMMANDS_ENV
-    .split(/[\s,]+/) // Split by comma or whitespace, then trim
-    .map(cmd => cmd.trim())
-    .filter(cmd => cmd.length > 0)
-);
-
-// Helper: check if command is allowed
-function isCommandAllowed(cmd) {
-  // With strict mode enforced at startup, all commands must be in the whitelist
-  return allowedCommands.has(cmd);
-}
-
-// Helper: extract command string from request body
-function getCmdString(req) {
-  return new Promise((resolve, reject) => {
-    let body = '';
-    req.on('data', chunk => {
-      body += chunk;
-    });
-    req.on('end', () => {
-      // Strip trailing newline if present, but preserve internal whitespace
-      let cmd = body;
-      // Remove trailing newlines/carriage returns
-      cmd = cmd.replace(/\n|\r/g, '');
-      if (cmd.trim() === '') {
-        resolve('');
-      } else {
-        resolve(cmd.trim());
-      }
-    });
-    req.on('error', reject);
-  });
-}
-
-// Execute command and stream output
-function executeCommand(cmdString) {
-  return new Promise((resolve, reject) => {
-    const child = exec(cmdString, {
-      maxBuffer: 1024 * 1024,
-    }, (error, stdout, stderr) => {
-      const exitCode = error ? (error.code || 1) : 0;
-      resolve({ stdout, exitCode });
-    });
-
-    // Handle stderr events (ignored in v1)
-    child.stderr.on('data', () => {});
-  });
-}
-
-// Bash functions to serve at /bash endpoint - PORT interpolated directly
-const SHTTP_BASH_FUNCTIONS = `function shttp() {
-  SHTTP_WRAPPER_URL="\${SHTTP_WRAPPER_URL:-http://localhost:${PORT}}"
-  if [ $# -eq 0 ]; then
-      echo "Usage: $0 <command> [args...]" >&2
-      return 1
-  fi
-  cmd_string=$(printf '%s\\n' "$*")
-  response=$(curl -sS -f -X POST "\${SHTTP_WRAPPER_URL}/" \\
-      -H "Content-Type: text/plain" \\
-      -d "\${cmd_string}")
-
-  if echo "$response" | grep -q "__EXIT_CODE__:"; then
-      stdout=$(echo "$response" | sed 's/__EXIT_CODE__:.*$//')
-      exit_code=$(echo "$response" | sed 's/.*__EXIT_CODE__:\\(.*\\)/\\1/')
-
-      if [ -n "$stdout" ]; then
-          printf '%s' "$stdout"
-      fi
-
-      if [ "$exit_code" -eq "$exit_code" ] 2>/dev/null; then
-          return "$exit_code"
-      fi
-      return 0
-  fi
-
-  printf '%s' "$response"
-  return 0
-}
-`;
 
 // Create HTTP server
 const server = http.createServer(async (req, res) => {
@@ -122,7 +23,7 @@ const server = http.createServer(async (req, res) => {
     // Add functions for allowed commands
     for (const cmd of allowedCommands) {
       funcs.push(`function ${cmd}() {
-  shttp ${cmd} "$@";
+  shttp ${cmd} "\$@";
 }`);
     }
 
@@ -132,22 +33,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   // Only accept POST to root path
-  if (req.method !== 'POST' || req.url !== '/') {
+  if (req.method !== 'POST' || !req.url.startsWith('/')) {
     res.writeHead(405, { 'Content-Type': 'text/plain' });
-    res.end('Method not allowed. Use POST / or GET /bash');
+    res.end('Method not allowed. Use POST /?cmd=... or GET /bash');
     return;
   }
 
-  // Content-Type check is optional since we accept raw string
-  // But we still need to read the body
-
   try {
-    // Get raw command string from request body
-    const cmdString = await getCmdString(req);
+    // Get command string from query parameter
+    const cmdString = getCmdFromQuery(req);
 
     if (!cmdString || cmdString.length === 0) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
-      res.end('Empty command string');
+      res.end('Missing or empty "cmd" query parameter');
       return;
     }
 
@@ -162,14 +60,13 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
-    // Execute command
-    const { stdout, exitCode } = await executeCommand(cmdString);
+    // Execute command with stdin from request body
+    const { stdout, exitCode } = await executeCommand(cmdString, req, res);
 
     // Return stdout followed by exit code marker
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.write(stdout);
     res.end(`__EXIT_CODE__:${exitCode}`);
-
   } catch (err) {
     console.error('Server error:', err);
     res.writeHead(500, { 'Content-Type': 'text/plain' });
@@ -178,11 +75,60 @@ const server = http.createServer(async (req, res) => {
 });
 
 // Start server
-server.listen(PORT, () => {
-  console.log(`shttp server listening on port ${PORT}`);
-  console.log(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)' }"`);
-  console.log(`Endpoint: POST http://localhost:${PORT}/`);
-  console.log(`Bash functions: GET http://localhost:${PORT}/bash`);
-  console.log('Body format: Raw string "git commit -m \\"msg\\""');
+const url = new URL(SHTTP_ENDPOINT)
+server.listen(url.port || 8080, () => {
+  console.log(`shttp server listening on ${SHTTP_ENDPOINT}`);
+  console.log(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)'}"`);
+  console.log(`Endpoint: POST ${SHTTP_ENDPOINT}/?cmd=<command>`);
+  console.log('Body format: stdin for the command');
   console.log('Response: stdout + __EXIT_CODE__:N');
 });
+
+// Helper functions
+const allowedCommands = ALLOWED_COMMANDS_ENV.split(',').map(s => s.trim()).filter(Boolean);
+
+function getCmdFromQuery(req) {
+  const query = new URL(req.url, SHTTP_ENDPOINT).searchParams;
+  return query.get('cmd') || null;
+}
+
+function isCommandAllowed(cmd) {
+  return allowedCommands.includes(cmd);
+}
+
+async function executeCommand(cmdString, req, res) {
+  // TODO: What to do if no content is piped into curl?
+  // Is it possible to detect if something was piped into body before opening a pipe
+
+  // TODO: What if cmd expects stdin and hangs but there is not body provided in req.
+  // Does cat spawn cause eror when spawned but no stdin provided?
+
+  // Run through /bin/sh -c so shell quoting and spacing are preserved
+  // TODO: Check that cmdString cannot write to a file especially not a file that can then be run.
+  const child = spawn('/bin/sh', ['-c', cmdString], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: process.env
+  });
+
+
+  // Pipe request body (stdin) to child stdin, handle errors gracefully
+  req.pipe(child.stdin).on('error', (err) => {
+    // Print the error to console please.
+    console.error
+    // Ignore pipe errors (e.g., client disconnected)
+  });
+
+  let stdout = '';
+  child.stdout.on('data', (chunk) => {
+    stdout += chunk;
+  });
+
+  return new Promise((resolve) => {
+    child.on('close', (code) => {
+      resolve({ stdout, exitCode: code || 0 });
+    });
+    child.on('error', (err) => {
+      resolve({ stdout: '', exitCode: 1 });
+    });
+  });
+}
