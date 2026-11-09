@@ -1,0 +1,134 @@
+// shttp - Node.js HTTP proxy server
+// Allows running commands from the PATH via HTTP with a whitelist
+//
+// Usage: node shttp.js
+//
+// Environment variables:
+//   SHTTP_PORT         Server port (default: 8080)
+//   SHTTP_ALLOWED_COMMANDS Whitelist of commands allowed (e.g., "git curl wget python")
+//
+// API:
+//   POST /
+//   Content-Type: text/plain (or any)
+//   Body: Raw command string "git commit -m \"msg\""
+//
+// Response:
+//   - Streams stdout from the executed command
+//   - Returns exit code via trailing "__EXIT_CODE__:N" marker
+
+const http = require('http');
+const { exec } = require('child_process');
+
+// Configuration
+const PORT = process.env.SHTTP_PORT || 8080;
+const ALLOWED_COMMANDS_ENV = process.env.SHTTP_ALLOWED_COMMANDS || '';
+
+// Parse whitelist into a Set
+const allowedCommands = new Set(
+  ALLOWED_COMMANDS_ENV.split(',')
+    .map(cmd => cmd.trim())
+    .filter(cmd => cmd.length > 0)
+);
+
+// Helper: check if command is allowed
+function isCommandAllowed(cmd) {
+  if (ALLOWED_COMMANDS_ENV === '') {
+    // If no whitelist set, allow all commands (for development)
+    return true;
+  }
+  return allowedCommands.has(cmd);
+}
+
+// Helper: extract command string from request body
+function getCmdString(req) {
+  return new Promise((resolve, reject) => {
+    let body = '';
+    req.on('data', chunk => {
+      body += chunk;
+    });
+    req.on('end', () => {
+      // Strip trailing newline if present, but preserve internal whitespace
+      let cmd = body;
+      // Remove trailing newlines/carriage returns
+      cmd = cmd.replace(/\n|\r/g, '');
+      if (cmd.trim() === '') {
+        resolve('');
+      } else {
+        resolve(cmd.trim());
+      }
+    });
+    req.on('error', reject);
+  });
+}
+
+// Execute command and stream output
+function executeCommand(cmdString) {
+  return new Promise((resolve, reject) => {
+    const child = exec(cmdString, {
+      maxBuffer: 1024 * 1024,
+    }, (error, stdout, stderr) => {
+      const exitCode = error ? (error.code || 1) : 0;
+      resolve({ stdout, exitCode });
+    });
+
+    // Handle stderr events (ignored in v1)
+    child.stderr.on('data', () => {});
+  });
+}
+
+// Create HTTP server
+const server = http.createServer(async (req, res) => {
+  // Only accept POST to root path
+  if (req.method !== 'POST' || req.url !== '/') {
+    res.writeHead(405, { 'Content-Type': 'text/plain' });
+    res.end('Method not allowed. Use POST /');
+    return;
+  }
+
+  // Content-Type check is optional since we accept raw string
+  // But we still need to read the body
+
+  try {
+    // Get raw command string from request body
+    const cmdString = await getCmdString(req);
+
+    if (!cmdString || cmdString.length === 0) {
+      res.writeHead(400, { 'Content-Type': 'text/plain' });
+      res.end('Empty command string');
+      return;
+    }
+
+    // Extract the command (first word) from the command string
+    const parts = cmdString.trim().split(/\s+/);
+    const cmd = parts[0];
+
+    // Check if command is allowed
+    if (!isCommandAllowed(cmd)) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(`Command "${cmd}" is not allowed. Add it to SHTTP_ALLOWED_COMMANDS.`);
+      return;
+    }
+
+    // Execute command
+    const { stdout, exitCode } = await executeCommand(cmdString);
+
+    // Return stdout followed by exit code marker
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.write(stdout);
+    res.end(`__EXIT_CODE__:${exitCode}`);
+
+  } catch (err) {
+    console.error('Server error:', err);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end(`Server error: ${err.message}`);
+  }
+});
+
+// Start server
+server.listen(PORT, () => {
+  console.log(`shttp server listening on port ${PORT}`);
+  console.log(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)' }"`);
+  console.log(`Endpoint: POST http://localhost:${PORT}/`);
+  console.log('Body format: Raw string "git commit -m \\\"msg\\""');
+  console.log('Response: stdout + __EXIT_CODE__:N');
+});

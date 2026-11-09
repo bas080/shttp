@@ -1,0 +1,51 @@
+#!/bin/sh
+
+# shttp - Bash utility wrapper for the shttp HTTP proxy server
+# Usage: shttp <command> [args...]
+# Example: shttp git commit -m "Initial commit"
+#
+# Environment variables:
+#   SHTTP_WRAPPER_URL  Server URL (default: http://localhost:8080)
+
+set -eu
+
+SHTTP_WRAPPER_URL="${SHTTP_WRAPPER_URL:-http://localhost:8080}"
+
+# Show usage if no arguments provided
+if [ $# -eq 0 ]; then
+    echo "Usage: $0 <command> [args...]" >&2
+    echo "Example: $0 git commit -m 'Initial commit'" >&2
+    exit 1
+fi
+
+# Join all arguments into a single command string
+cmd_string=$(printf '%s\n' "$*")
+
+# Send POST request to the server
+# Use -f to fail on HTTP error status codes (e.g., 403)
+response=$(curl -sS -f -X POST "${SHTTP_WRAPPER_URL}/" \
+    -H "Content-Type: text/plain" \
+    -d "${cmd_string}")
+
+# Extract stdout and exit code from response
+# Response format: stdout\n__EXIT_CODE__:N
+if echo "$response" | grep -q "__EXIT_CODE__:"; then
+    # Extract stdout (everything before the marker) and exit code
+    stdout=$(echo "$response" | sed 's/__EXIT_CODE__:.*$//')
+    exit_code=$(echo "$response" | sed 's/.*__EXIT_CODE__:\(.*\)/\1/')
+    
+    # Output stdout only
+    if [ -n "$stdout" ]; then
+        printf '%s' "$stdout"
+    fi
+    
+    # Exit with the command's exit code
+    if [ "$exit_code" -eq "$exit_code" ] 2>/dev/null; then
+        exit "$exit_code"
+    fi
+    exit 0
+fi
+
+# If no exit code marker found, just output the response and exit 0
+printf '%s' "$response"
+exit 0
