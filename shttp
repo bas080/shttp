@@ -1,7 +1,9 @@
+#!/usr/bin/env node
+
 // shttp - Node.js HTTP proxy server
 // Allows running commands from the PATH via HTTP with a whitelist
 //
-// Usage: node shttp.js
+// Usage: node shttp
 //
 // Environment variables:
 //   SHTTP_PORT         Server port (default: 8080)
@@ -23,19 +25,23 @@ const { exec } = require('child_process');
 const PORT = process.env.SHTTP_PORT || 8080;
 const ALLOWED_COMMANDS_ENV = process.env.SHTTP_ALLOWED_COMMANDS || '';
 
-// Parse whitelist into a Set
+// Exit with non-zero code if whitelist is not configured (strict mode)
+if (ALLOWED_COMMANDS_ENV === '') {
+  console.error('Error: SHTTP_ALLOWED_COMMANDS is not configured. No commands will be allowed.');
+  process.exit(1);
+}
+
+// Parse whitelist into a Set (split by comma or whitespace)
 const allowedCommands = new Set(
-  ALLOWED_COMMANDS_ENV.split(',')
+  ALLOWED_COMMANDS_ENV
+    .split(/[\s,]+/) // Split by comma or whitespace, then trim
     .map(cmd => cmd.trim())
     .filter(cmd => cmd.length > 0)
 );
 
 // Helper: check if command is allowed
 function isCommandAllowed(cmd) {
-  if (ALLOWED_COMMANDS_ENV === '') {
-    // If no whitelist set, allow all commands (for development)
-    return true;
-  }
+  // With strict mode enforced at startup, all commands must be in the whitelist
   return allowedCommands.has(cmd);
 }
 
@@ -76,12 +82,59 @@ function executeCommand(cmdString) {
   });
 }
 
+// Bash functions to serve at /bash endpoint - PORT interpolated directly
+const SHTTP_BASH_FUNCTIONS = `function shttp() {
+  SHTTP_WRAPPER_URL="\${SHTTP_WRAPPER_URL:-http://localhost:${PORT}}"
+  if [ $# -eq 0 ]; then
+      echo "Usage: $0 <command> [args...]" >&2
+      return 1
+  fi
+  cmd_string=$(printf '%s\\n' "$*")
+  response=$(curl -sS -f -X POST "\${SHTTP_WRAPPER_URL}/" \\
+      -H "Content-Type: text/plain" \\
+      -d "\${cmd_string}")
+
+  if echo "$response" | grep -q "__EXIT_CODE__:"; then
+      stdout=$(echo "$response" | sed 's/__EXIT_CODE__:.*$//')
+      exit_code=$(echo "$response" | sed 's/.*__EXIT_CODE__:\\(.*\\)/\\1/')
+
+      if [ -n "$stdout" ]; then
+          printf '%s' "$stdout"
+      fi
+
+      if [ "$exit_code" -eq "$exit_code" ] 2>/dev/null; then
+          return "$exit_code"
+      fi
+      return 0
+  fi
+
+  printf '%s' "$response"
+  return 0
+}
+`;
+
 // Create HTTP server
 const server = http.createServer(async (req, res) => {
+  // Handle /bash endpoint - export functions for allowed commands
+  if (req.method === 'GET' && req.url === '/bash') {
+    const funcs = [SHTTP_BASH_FUNCTIONS];
+
+    // Add functions for allowed commands
+    for (const cmd of allowedCommands) {
+      funcs.push(`function ${cmd}() {
+  shttp ${cmd} "$@";
+}`);
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    res.end(funcs.join('\n') + '\n');
+    return;
+  }
+
   // Only accept POST to root path
   if (req.method !== 'POST' || req.url !== '/') {
     res.writeHead(405, { 'Content-Type': 'text/plain' });
-    res.end('Method not allowed. Use POST /');
+    res.end('Method not allowed. Use POST / or GET /bash');
     return;
   }
 
@@ -129,6 +182,7 @@ server.listen(PORT, () => {
   console.log(`shttp server listening on port ${PORT}`);
   console.log(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)' }"`);
   console.log(`Endpoint: POST http://localhost:${PORT}/`);
-  console.log('Body format: Raw string "git commit -m \\\"msg\\""');
+  console.log(`Bash functions: GET http://localhost:${PORT}/bash`);
+  console.log('Body format: Raw string "git commit -m \\"msg\\""');
   console.log('Response: stdout + __EXIT_CODE__:N');
 });

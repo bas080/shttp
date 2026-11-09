@@ -8,6 +8,7 @@ A lightweight HTTP proxy server that allows running commands from the PATH (or a
 - **Simple Bash Utility**: A CLI tool named `shttp` (written in sh) that uses `curl` to forward arguments and stdin to the configured server. The `shttp` utility exits with the same exit code as the command that ran and outputs stdout only.
 - **Whitelist Configuration**: Control which commands are allowed via an environment variable (`SHTTP_ALLOWED_COMMANDS`).
 - **HTTP Interface**: The server exposes a simple HTTP endpoint for command execution.
+- **Bash Function Export**: The server provides a `/bash` endpoint that outputs bash function definitions which can be sourced in a bash environment. Each function is named after an allowed command from `SHTTP_ALLOWED_COMMANDS`, and its body calls the `shttp` utility with the same command name.
 - **Aliases**: Define shell aliases to quickly proxy specific commands via HTTP.
 
 ## Quick Start
@@ -42,12 +43,23 @@ Send a POST request with a raw string body:
 curl -X POST http://localhost:8080/ -H "Content-Type: text/plain" -d 'git commit -m "Initial commit"'
 ```
 
+### 4. Source Bash Functions
+
+Source the exported bash functions to run allowed commands directly:
+
+```bash
+eval "$(curl -s http://localhost:8080/bash)"
+```
+
+Now you can run `git`, `curl`, `wget`, etc. directly as shell functions, which will proxy through the shttp server.
+
 ## How It Works
 
 1. The `shttp` server listens on a configurable port (default: 8080).
 2. When a POST request is received with a raw string body like `git commit -m "Initial commit"`, the server splits it into the command and arguments.
 3. If the command is in the `SHTTP_ALLOWED_COMMANDS` whitelist, it is executed with the remaining arguments.
 4. The server streams **stdout** back to the client via HTTP response, and returns the command's exit code.
+5. For convenience, the server also provides a `/bash` endpoint that outputs bash function definitions which can be sourced in a bash environment. Each function is named after an allowed command from `SHTTP_ALLOWED_COMMANDS`, and its body calls the `shttp` utility with the same command name.
 
 ## Configuration
 
@@ -88,6 +100,33 @@ alias git='shttp git'
 ```
 
 Now you can run `git commit -m "msg"` to proxy `git commit` through the server.
+
+## Bash Function Export
+
+The server also provides a `/bash` endpoint that outputs bash function definitions which can be sourced in a bash environment. Each function is named after an allowed command from `SHTTP_ALLOWED_COMMANDS`, and its body calls the `shttp` utility with the same command name:
+
+```bash
+function shttp { shttp "$@"; }
+function git { shttp git "$@"; }
+function curl { shttp curl "$@"; }
+function wget { shttp wget "$@"; }
+```
+
+To use this feature, source the output in your shell:
+
+```bash
+eval "$(curl -s http://localhost:8080/bash)"
+```
+
+Now you can run allowed commands directly as shell functions, which will proxy through the shttp server:
+
+```bash
+git commit -m "Initial commit"
+curl https://example.com/file.zip
+wget https://example.com/file.zip
+```
+
+The `/bash` endpoint is available at `GET /bash`. It respects the `SHTTP_ALLOWED_COMMANDS` whitelist - only listed commands will have functions generated.
 
 ## Usage Examples
 

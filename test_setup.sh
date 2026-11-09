@@ -52,28 +52,40 @@ else
 fi
 
 echo ""
-echo "=== Testing server startup (Node.js) ==="
+echo "=== Testing server startup with no whitelist (should fail) ==="
 
+unset SHTTP_ALLOWED_COMMANDS
+echo "Starting server without SHTTP_ALLOWED_COMMANDS..."
 node "$SERVER" &
 server_pid=$!
-echo "Server PID: $server_pid"
 sleep 2
 
+# Check if server process is still running
+if ps -p "$server_pid" > /dev/null 2>&1; then
+    echo "❌ Server should have exited when SHTTP_ALLOWED_COMMANDS is not set"
+    kill "$server_pid" 2>/dev/null || true
+else
+    echo "✅ Server correctly exited when SHTTP_ALLOWED_COMMANDS is not configured"
+fi
+
 echo ""
-echo "=== Testing server is running ==="
+echo "=== Testing server startup with whitelist ==="
+
+export SHTTP_ALLOWED_COMMANDS="echo"
+echo "Starting server with whitelist: echo"
+node "$SERVER" &
+server_pid=$!
+sleep 2
 
 # Check if server process is running
 if ps -p "$server_pid" > /dev/null 2>&1; then
-    echo "✅ Server is running on port 8080"
+    echo "✅ Server is running with whitelist configured"
 else
-    echo "❌ Server failed to start"
+    echo "❌ Server failed to start with whitelist"
 fi
 
 echo ""
 echo "=== Testing whitelist enforcement ==="
-
-# Set whitelist to only allow 'echo'
-export SHTTP_ALLOWED_COMMANDS="echo"
 
 echo "Test 1: Allowed command 'echo hello'"
 result=$("$CLIENT" echo hello 2>&1)
@@ -81,33 +93,33 @@ exit_code=$?
 echo "Exit code: $exit_code"
 echo "Output: $result"
 if [ "$exit_code" -eq 0 ] && echo "$result" | grep -q "hello"; then
-    echo "✅ Allowed command 'echo' works correctly"
+    echo "✅ Whitelist allows 'echo' command"
 else
-    echo "❌ Allowed command 'echo' failed"
+    echo "❌ Whitelist should allow 'echo' command"
 fi
 
 echo ""
-echo "Test 2: Disallowed command 'rm -rf /tmp/test'"
-result=$("$CLIENT" rm -rf /tmp/test 2>&1)
-exit_code=$?
-echo "Exit code: $exit_code"
-echo "Output: $result"
-if [ "$exit_code" -ne 0 ]; then
-    echo "✅ Disallowed command 'rm' correctly rejected (exit code: $exit_code)"
-else
-    echo "❌ Disallowed command 'rm' was not rejected"
-fi
-
-echo ""
-echo "Test 3: Disallowed command 'ls /etc'"
+echo "Test 2: Disallowed command 'ls /etc'"
 result=$("$CLIENT" ls /etc 2>&1)
 exit_code=$?
 echo "Exit code: $exit_code"
 echo "Output: $result"
 if [ "$exit_code" -ne 0 ]; then
-    echo "✅ Disallowed command 'ls' correctly rejected (exit code: $exit_code)"
+    echo "✅ Whitelist correctly rejects 'ls' command"
 else
-    echo "❌ Disallowed command 'ls' was not rejected"
+    echo "❌ Whitelist should reject 'ls' command"
+fi
+
+echo ""
+echo "Test 3: Disallowed command 'git commit -m \"msg\"'"
+result=$("$CLIENT" git commit -m "msg" 2>&1)
+exit_code=$?
+echo "Exit code: $exit_code"
+echo "Output: $result"
+if [ "$exit_code" -ne 0 ]; then
+    echo "✅ Whitelist correctly rejects 'git' command"
+else
+    echo "❌ Whitelist should reject 'git' command"
 fi
 
 echo ""
@@ -120,8 +132,8 @@ echo ""
 echo "=== Setup test completed ==="
 echo ""
 echo "To run shttp:"
-echo "1. Export environment variables: export SHTTP_ALLOWED_COMMANDS='echo'"
-echo "2. Start server: node $SERVER"
-echo "3. Run client: $CLIENT echo hello"
-echo "4. Or via alias: alias echo=$CLIENT"
-wait
+echo "1. No environment variables - server will exit with error"
+echo "2. Set whitelist: export SHTTP_ALLOWED_COMMANDS='echo'"
+echo "3. Start server: node $SERVER"
+echo "4. Run client: $CLIENT echo hello"
+echo "5. Or via alias: alias echo=$CLIENT"
