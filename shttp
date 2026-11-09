@@ -9,6 +9,7 @@
 
 const http = require('http');
 const { spawn } = require('child_process');
+const debug = require('debug')('shttp');
 
 // Configuration
 const SHTTP_ENDPOINT = process.env.SHTTP_ENDPOINT || 'http://localhost:8080';
@@ -16,9 +17,20 @@ const ALLOWED_COMMANDS_ENV = process.env.SHTTP_ALLOWED_COMMANDS || '';
 
 // Create HTTP server
 const server = http.createServer(async (req, res) => {
+  debug('incoming request: %s %s', req.method, req.url);
+
   // Handle /bash endpoint - export functions for allowed commands
   if (req.method === 'GET' && req.url === '/bash') {
-    const funcs = [SHTTP_BASH_FUNCTIONS];
+    debug('/bash endpoint requested');
+    const funcs = [];
+
+
+    // Add shttp function wrapper
+    funcs.push(`function shttp() {
+  local cmd="$1"; shift
+  local args="\${@@Q}"
+  curl -s -X POST "$(eval echo "${SHTTP_ENDPOINT}/?cmd=$cmd $args")" | sed -E 's/__EXIT_CODE__:[0-9]+$//'
+}`);
 
     // Add functions for allowed commands
     for (const cmd of allowedCommands) {
@@ -45,6 +57,7 @@ const server = http.createServer(async (req, res) => {
 
     if (!cmdString || cmdString.length === 0) {
       res.writeHead(400, { 'Content-Type': 'text/plain' });
+      debug('error: missing or empty cmd query parameter');
       res.end('Missing or empty "cmd" query parameter');
       return;
     }
@@ -53,22 +66,28 @@ const server = http.createServer(async (req, res) => {
     const parts = cmdString.trim().split(/\s+/);
     const cmd = parts[0];
 
+    debug('parsing command: cmdString=%s, parts=%s', cmdString, parts);
+
     // Check if command is allowed
     if (!isCommandAllowed(cmd)) {
       res.writeHead(403, { 'Content-Type': 'text/plain' });
+      debug('error: command "%s" is not allowed', cmd);
       res.end(`Command "${cmd}" is not allowed. Add it to SHTTP_ALLOWED_COMMANDS.`);
       return;
     }
+
+    debug('command "%s" is allowed, executing', cmd);
 
     // Execute command with stdin from request body
     const { stdout, exitCode } = await executeCommand(cmdString, req, res);
 
     // Return stdout followed by exit code marker
+    debug('sending response with exit code %d', exitCode);
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     res.write(stdout);
     res.end(`__EXIT_CODE__:${exitCode}`);
   } catch (err) {
-    console.error('Server error:', err);
+    debug('Server error:', err);
     res.writeHead(500, { 'Content-Type': 'text/plain' });
     res.end(`Server error: ${err.message}`);
   }
@@ -77,15 +96,16 @@ const server = http.createServer(async (req, res) => {
 // Start server
 const url = new URL(SHTTP_ENDPOINT)
 server.listen(url.port || 8080, () => {
-  console.log(`shttp server listening on ${SHTTP_ENDPOINT}`);
-  console.log(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)'}"`);
-  console.log(`Endpoint: POST ${SHTTP_ENDPOINT}/?cmd=<command>`);
-  console.log('Body format: stdin for the command');
-  console.log('Response: stdout + __EXIT_CODE__:N');
+  debug(`shttp server listening on ${SHTTP_ENDPOINT}`);
+  debug(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)'}"`);
+  debug(`Endpoint: POST ${SHTTP_ENDPOINT}/?cmd=<command>`);
+  debug('Body format: stdin for the command');
+  debug('Response: stdout + __EXIT_CODE__:N');
 });
 
 // Helper functions
-const allowedCommands = ALLOWED_COMMANDS_ENV.split(',').map(s => s.trim()).filter(Boolean);
+const allowedCommands = ALLOWED_COMMANDS_ENV.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
+debug('allowedCommands', allowedCommands)
 
 function getCmdFromQuery(req) {
   const query = new URL(req.url, SHTTP_ENDPOINT).searchParams;
@@ -97,11 +117,10 @@ function isCommandAllowed(cmd) {
 }
 
 async function executeCommand(cmdString, req, res) {
-  // TODO: What to do if no content is piped into curl?
-  // Is it possible to detect if something was piped into body before opening a pipe
-
-  // TODO: What if cmd expects stdin and hangs but there is not body provided in req.
-  // Does cat spawn cause eror when spawned but no stdin provided?
+  // Check if request has a body (content-length > 0 or transfer-encoding chunked)
+  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+  const hasBody = contentLength > 0 || req.headers['transfer-encoding'] !== undefined;
+  debug('executeCommand called with cmdString=%s, hasBody=%s', cmdString, hasBody);
 
   // Run through /bin/sh -c so shell quoting and spacing are preserved
   // TODO: Check that cmdString cannot write to a file especially not a file that can then be run.
@@ -110,24 +129,44 @@ async function executeCommand(cmdString, req, res) {
     env: process.env
   });
 
+  debug('child process spawned with cmd=%s', cmdString);
 
   // Pipe request body (stdin) to child stdin, handle errors gracefully
-  req.pipe(child.stdin).on('error', (err) => {
-    // Print the error to console please.
-    console.error
-    // Ignore pipe errors (e.g., client disconnected)
-  });
+  // If no body provided, close stdin immediately to prevent commands from hanging
+  // waiting for input that will never arrive.
+  if (!hasBody) {
+    child.stdin.end();
+    debug('no body provided, closing stdin immediately');
+  } else {
+    req.pipe(child.stdin).on('error', (err) => {
+      debug('Pipe error:', err);
+      // Ignore pipe errors (e.g., client disconnected)
+    });
+  }
 
   let stdout = '';
   child.stdout.on('data', (chunk) => {
     stdout += chunk;
+    debug('stdout chunk received: %s', chunk.toString().trim());
   });
+
+  // Add a timeout to prevent commands from hanging indefinitely
+  // (e.g., waiting on stdin, network, or other blocking operations)
+  const timeoutMs = 30000;
+  const timeoutId = setTimeout(() => {
+    debug('timeout reached, killing child process');
+    child.kill('SIGTERM');
+  }, timeoutMs);
 
   return new Promise((resolve) => {
     child.on('close', (code) => {
+      clearTimeout(timeoutId);
+      debug('child process exited with code %d', code);
       resolve({ stdout, exitCode: code || 0 });
     });
     child.on('error', (err) => {
+      clearTimeout(timeoutId);
+      debug('child process error: %s', err.message);
       resolve({ stdout: '', exitCode: 1 });
     });
   });
