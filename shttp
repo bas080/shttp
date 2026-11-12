@@ -1,173 +1,385 @@
 #!/usr/bin/env node
 
 // shttp - Node.js HTTP proxy server
-// Allows running commands from the PATH via HTTP with a whitelist
-
+// Execute whitelisted commands from PATH via HTTP.
+//
 // Environment variables:
-//   SHTTP_ENDPOINT      Server endpoint (default: http://localhost:8080)
-//   SHTTP_ALLOWED_COMMANDS Whitelist of commands allowed (e.g., "git curl wget python")
+//   SHTTP_ENDPOINT          Server endpoint (default: http://localhost:8080)
+//   SHTTP_ALLOWED_COMMANDS  Whitelist (e.g. "git curl wget python")
 
 const http = require('http');
 const { spawn } = require('child_process');
 const debug = require('debug')('shttp');
 
-// Configuration
-const SHTTP_ENDPOINT = process.env.SHTTP_ENDPOINT || 'http://localhost:8080';
-const ALLOWED_COMMANDS_ENV = process.env.SHTTP_ALLOWED_COMMANDS || '';
+process.title = 'shttp';
 
-// Create HTTP server
+const SHTTP_ENDPOINT = process.env.SHTTP_ENDPOINT || 'http://localhost:8080';
+
+const MAX_BODY_SIZE = 10 * 1024 * 1024;
+const MAX_OUTPUT_SIZE = 5 * 1024 * 1024;
+const MAX_STDERR_HEADER_SIZE = 4096;
+const TIMEOUT_MS = 30000;
+const KILL_GRACE_MS = 1000;
+
+let allowedCommands = parseAllowedCommands();
+
+function parseAllowedCommands() {
+  return (process.env.SHTTP_ALLOWED_COMMANDS || '')
+    .split(/[,\s]+/)
+    .map(s => s.trim())
+    .filter(Boolean);
+}
+
 const server = http.createServer(async (req, res) => {
   debug('incoming request: %s %s', req.method, req.url);
 
-  // Handle /bash endpoint - export functions for allowed commands
   if (req.method === 'GET' && req.url === '/bash') {
-    debug('/bash endpoint requested');
     const funcs = [];
 
+    funcs.push(`shttp_client() {
+  local cmd="$1"
+  shift
 
-    // Add shttp function wrapper
-    funcs.push(`function shttp() {
-  local cmd="$1"; shift
-  local args="\${@@Q}"
-  curl -s -X POST "$(eval echo "${SHTTP_ENDPOINT}/?cmd=$cmd $args")" | sed -E 's/__EXIT_CODE__:[0-9]+$//'
+  local payload
+  local headers_file
+  local output_file
+  local curl_status
+  local exit_code
+  local remote_stderr
+
+  payload=$(command jq -cn --args '$ARGS.positional' "$cmd" "$@") || return 1
+
+  headers_file=$(command mktemp) || return 1
+  output_file=$(command mktemp) || {
+    command rm -f "$headers_file"
+    return 1
+  }
+
+  {
+    builtin printf '%s\\n' "$payload"
+
+    if [ ! -t 0 ]; then
+      command cat
+    fi
+  } | command curl --fail --silent --show-error \\
+      --data-binary @- \\
+      -D "$headers_file" \\
+      -o "$output_file" \\
+      "${SHTTP_ENDPOINT}/"
+
+  curl_status=$?
+
+  if [ "$curl_status" -ne 0 ]; then
+    command cat "$output_file" >&2
+    command rm -f "$headers_file" "$output_file"
+    return "$curl_status"
+  fi
+
+  exit_code=$(command awk 'tolower($1) == "x-shttp-exit-code:" {gsub("\\\\r", "", $2); print $2}' "$headers_file")
+
+  remote_stderr=$(command awk 'tolower($1) == "x-shttp-stderr:" {gsub("\\\\r", "", $2); print $2}' "$headers_file")
+
+  if [ -n "$remote_stderr" ]; then
+    builtin printf '%s' "$remote_stderr" | command base64 -d >&2
+  fi
+
+  command cat "$output_file"
+
+  command rm -f "$headers_file" "$output_file"
+
+  [[ "$exit_code" =~ ^[0-9]+$ ]] || exit_code=1
+  return "$exit_code"
 }`);
 
-    // Add functions for allowed commands
+    const reserved = new Set([
+      'builtin', 'command',
+      'if', 'then', 'else', 'elif', 'fi',
+      'for', 'while', 'until', 'do', 'done',
+      'case', 'esac', 'in', 'function',
+      'select', 'time', 'coproc',
+      'shttp_client'
+    ]);
+
     for (const cmd of allowedCommands) {
-      funcs.push(`function ${cmd}() {
-  shttp ${cmd} "\$@";
+      if (!/^[a-zA-Z0-9_-]+$/.test(cmd) || reserved.has(cmd)) {
+        continue;
+      }
+
+      funcs.push(`${cmd}() {
+  shttp_client '${cmd}' "$@"
 }`);
     }
 
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.end(funcs.join('\n') + '\n');
+    res.writeHead(200, {
+      'Content-Type': 'text/plain; charset=utf-8'
+    });
+
+    res.end(funcs.join('\n\n') + '\n');
     return;
   }
 
-  // Only accept POST to root path
-  if (req.method !== 'POST' || !req.url.startsWith('/')) {
-    res.writeHead(405, { 'Content-Type': 'text/plain' });
-    res.end('Method not allowed. Use POST /?cmd=... or GET /bash');
+  if (req.method !== 'POST' || req.url !== '/') {
+    res.writeHead(405, {
+      'Content-Type': 'text/plain'
+    });
+    res.end('Method not allowed. Use POST /');
     return;
   }
 
   try {
-    // Get command string from query parameter
-    const cmdString = getCmdFromQuery(req);
-
-    if (!cmdString || cmdString.length === 0) {
-      res.writeHead(400, { 'Content-Type': 'text/plain' });
-      debug('error: missing or empty cmd query parameter');
-      res.end('Missing or empty "cmd" query parameter');
-      return;
-    }
-
-    // Extract the command (first word) from the command string
-    const parts = cmdString.trim().split(/\s+/);
-    const cmd = parts[0];
-
-    debug('parsing command: cmdString=%s, parts=%s', cmdString, parts);
-
-    // Check if command is allowed
-    if (!isCommandAllowed(cmd)) {
-      res.writeHead(403, { 'Content-Type': 'text/plain' });
-      debug('error: command "%s" is not allowed', cmd);
-      res.end(`Command "${cmd}" is not allowed. Add it to SHTTP_ALLOWED_COMMANDS.`);
-      return;
-    }
-
-    debug('command "%s" is allowed, executing', cmd);
-
-    // Execute command with stdin from request body
-    const { stdout, exitCode } = await executeCommand(cmdString, req, res);
-
-    // Return stdout followed by exit code marker
-    debug('sending response with exit code %d', exitCode);
-    res.writeHead(200, { 'Content-Type': 'text/plain' });
-    res.write(stdout);
-    res.end(`__EXIT_CODE__:${exitCode}`);
+    await readAndProcessRequest(req, res);
   } catch (err) {
-    debug('Server error:', err);
-    res.writeHead(500, { 'Content-Type': 'text/plain' });
-    res.end(`Server error: ${err.message}`);
+    debug('server error: %s', err.message);
+
+    if (!res.headersSent) {
+      res.writeHead(500, {
+        'Content-Type': 'text/plain'
+      });
+    }
+
+    res.end('Server error: ' + err.message);
   }
 });
 
-// Start server
-const url = new URL(SHTTP_ENDPOINT)
-server.listen(url.port || 8080, () => {
-  debug(`shttp server listening on ${SHTTP_ENDPOINT}`);
-  debug(`Whitelist: SHTTP_ALLOWED_COMMANDS = "${process.env.SHTTP_ALLOWED_COMMANDS || ' (none - all commands allowed)'}"`);
-  debug(`Endpoint: POST ${SHTTP_ENDPOINT}/?cmd=<command>`);
-  debug('Body format: stdin for the command');
-  debug('Response: stdout + __EXIT_CODE__:N');
-});
+function killProcessGroup(child, signal) {
+  if (!child.pid) return;
 
-// Helper functions
-const allowedCommands = ALLOWED_COMMANDS_ENV.split(/[,\s]+/).map(s => s.trim()).filter(Boolean);
-debug('allowedCommands', allowedCommands)
-
-function getCmdFromQuery(req) {
-  const query = new URL(req.url, SHTTP_ENDPOINT).searchParams;
-  return query.get('cmd') || null;
-}
-
-function isCommandAllowed(cmd) {
-  return allowedCommands.includes(cmd);
-}
-
-async function executeCommand(cmdString, req, res) {
-  // Check if request has a body (content-length > 0 or transfer-encoding chunked)
-  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
-  const hasBody = contentLength > 0 || req.headers['transfer-encoding'] !== undefined;
-  debug('executeCommand called with cmdString=%s, hasBody=%s', cmdString, hasBody);
-
-  // Run through /bin/sh -c so shell quoting and spacing are preserved
-  // TODO: Check that cmdString cannot write to a file especially not a file that can then be run.
-  const child = spawn('/bin/sh', ['-c', cmdString], {
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: process.env
-  });
-
-  debug('child process spawned with cmd=%s', cmdString);
-
-  // Pipe request body (stdin) to child stdin, handle errors gracefully
-  // If no body provided, close stdin immediately to prevent commands from hanging
-  // waiting for input that will never arrive.
-  if (!hasBody) {
-    child.stdin.end();
-    debug('no body provided, closing stdin immediately');
-  } else {
-    req.pipe(child.stdin).on('error', (err) => {
-      debug('Pipe error:', err);
-      // Ignore pipe errors (e.g., client disconnected)
-    });
+  try {
+    if (process.platform !== 'win32') {
+      process.kill(-child.pid, signal);
+    } else {
+      child.kill(signal);
+    }
+  } catch (err) {
+    if (err.code !== 'ESRCH') {
+      debug('kill error: %s', err.message);
+    }
   }
+}
 
-  let stdout = '';
-  child.stdout.on('data', (chunk) => {
-    stdout += chunk;
-    debug('stdout chunk received: %s', chunk.toString().trim());
-  });
+function executeCommand(cmd, args, stdinData) {
+  debug('executing: %s %j', cmd, args);
 
-  // Add a timeout to prevent commands from hanging indefinitely
-  // (e.g., waiting on stdin, network, or other blocking operations)
-  const timeoutMs = 30000;
-  const timeoutId = setTimeout(() => {
-    debug('timeout reached, killing child process');
-    child.kill('SIGTERM');
-  }, timeoutMs);
+  
 
-  return new Promise((resolve) => {
-    child.on('close', (code) => {
-      clearTimeout(timeoutId);
-      debug('child process exited with code %d', code);
-      resolve({ stdout, exitCode: code || 0 });
+  return new Promise(resolve => {
+    const child = spawn(cmd, args, {
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: process.env,
+      detached: process.platform !== 'win32'
     });
-    child.on('error', (err) => {
-      clearTimeout(timeoutId);
+
+    let stdout = [];
+    let stderr = [];
+    let outputSize = 0;
+    let settled = false;
+    let timedOut = false;
+    let outputLimitExceeded = false;
+    let killTimer;
+
+    const finish = result => {
+      if (settled) return;
+      settled = true;
+
+      clearTimeout(timeoutTimer);
+      clearTimeout(killTimer);
+
+      resolve(result);
+    };
+
+    const terminate = () => {
+      killProcessGroup(child, 'SIGTERM');
+
+      killTimer = setTimeout(() => {
+        killProcessGroup(child, 'SIGKILL');
+      }, KILL_GRACE_MS);
+
+      killTimer.unref();
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      timedOut = true;
+      debug('command timeout: %s', cmd);
+      terminate();
+    }, TIMEOUT_MS);
+
+    function collect(target, chunk) {
+      outputSize += chunk.length;
+
+      if (outputSize > MAX_OUTPUT_SIZE) {
+        if (!outputLimitExceeded) {
+          outputLimitExceeded = true;
+          debug('output limit exceeded: %s', cmd);
+          terminate();
+        }
+        return;
+      }
+
+      target.push(chunk);
+    }
+
+    child.stdout.on('data', chunk => {
+      collect(stdout, chunk);
+    });
+
+    child.stderr.on('data', chunk => {
+      collect(stderr, chunk);
+    });
+
+    child.on('error', err => {
       debug('child process error: %s', err.message);
-      resolve({ stdout: '', exitCode: 1 });
+
+      finish({
+        stdout: Buffer.alloc(0),
+        stderr: Buffer.from(err.message),
+        exitCode: 1
+      });
     });
+
+    child.on('close', (code, signal) => {
+      debug('child exited: code=%s signal=%s', code, signal);
+
+      finish({
+        stdout: Buffer.concat(stdout),
+        stderr: Buffer.concat(stderr),
+        exitCode: timedOut || outputLimitExceeded ? 1 : (code ?? 1),
+        timedOut,
+        outputLimitExceeded
+      });
+    });
+
+    child.stdin.on('error', err => {
+      debug('stdin error: %s', err.message);
+    });
+
+    child.stdin.end(stdinData);
   });
 }
+
+async function readAndProcessRequest(req, res) {
+  const chunks = [];
+  let bodySize = 0;
+
+  for await (const chunk of req) {
+    bodySize += chunk.length;
+
+    if (bodySize > MAX_BODY_SIZE) {
+      res.writeHead(413, {
+        'Content-Type': 'text/plain'
+      });
+      res.end('Request body too large');
+      return;
+    }
+
+    chunks.push(chunk);
+  }
+
+  const body = Buffer.concat(chunks);
+  const separatorIndex = body.indexOf(0x0a);
+
+  if (separatorIndex === -1) {
+    res.writeHead(400, {
+      'Content-Type': 'text/plain'
+    });
+    res.end('Missing argument line');
+    return;
+  }
+
+  const argsLine = body.subarray(0, separatorIndex)
+    .toString('utf8')
+    .replace(/\r$/, '');
+
+  const stdinData = body.subarray(separatorIndex + 1);
+
+  let args;
+
+  try {
+    args = JSON.parse(argsLine);
+  } catch {
+    res.writeHead(400, {
+      'Content-Type': 'text/plain'
+    });
+    res.end('Invalid JSON argument array');
+    return;
+  }
+
+  if (
+    !Array.isArray(args) ||
+    args.length === 0 ||
+    args.some(arg => typeof arg !== 'string' || arg.includes('\0'))
+  ) {
+    res.writeHead(400, {
+      'Content-Type': 'text/plain'
+    });
+    res.end('Invalid command arguments');
+    return;
+  }
+
+  const [cmd, ...commandArgs] = args;
+
+  if (!cmd || cmd.includes('\0')) {
+    res.writeHead(400, {
+      'Content-Type': 'text/plain'
+    });
+    res.end('Missing command');
+    return;
+  }
+
+  debug('command: %s, args: %j, stdin bytes: %d',
+    cmd, commandArgs, stdinData.length);
+
+  if (!allowedCommands.includes(cmd)) {
+    res.writeHead(403, {
+      'Content-Type': 'text/plain'
+    });
+    res.end(`Command "${cmd}" is not allowed`);
+    return;
+  }
+
+  const result = await executeCommand(cmd, commandArgs, stdinData);
+
+  const headers = {
+    'Content-Type': 'application/octet-stream',
+    'X-SHTTP-Exit-Code': String(result.exitCode)
+  };
+
+  if (result.stderr.length > 0) {
+    headers['X-SHTTP-Stderr'] = result.stderr
+      .subarray(0, MAX_STDERR_HEADER_SIZE)
+      .toString('base64');
+  }
+
+  if (result.stderr.length > MAX_STDERR_HEADER_SIZE) {
+    headers['X-SHTTP-Stderr-Truncated'] = 'true';
+  }
+
+  if (result.timedOut) {
+    headers['X-SHTTP-Timeout'] = 'true';
+  }
+
+  if (result.outputLimitExceeded) {
+    headers['X-SHTTP-Output-Limit'] = 'true';
+  }
+
+  res.writeHead(
+    result.outputLimitExceeded ? 507 : 200,
+    headers
+  );
+
+  res.end(result.stdout);
+}
+
+// Refresh whitelist from environment.
+setInterval(() => {
+  allowedCommands = parseAllowedCommands();
+}, 60000).unref();
+
+const SHTTP_URL = new URL(SHTTP_ENDPOINT);
+
+server.listen(SHTTP_URL.port || 8080, () => {
+  debug('shttp listening on %s', SHTTP_ENDPOINT);
+  debug('Whitelist: %s', allowedCommands.join(' ') || '(none)');
+  debug('Endpoint: POST /');
+  debug('Body format: first line = JSON argv, remaining bytes = stdin');
+});

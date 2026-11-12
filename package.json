@@ -1,0 +1,17 @@
+{
+  "name": "shttp",
+  "version": "1.0.0",
+  "description": "A lightweight HTTP proxy server that allows running commands from the PATH (or any configured path) through HTTP.",
+  "main": "shttp.js",
+  "bin": {
+    "shttp": "./shttp"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "type": "commonjs",
+  "dependencies": {
+    "debug": "^4.4.3"
+  }
+}
