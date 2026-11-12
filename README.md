@@ -1,176 +1,144 @@
-# shttp
+# shttp - HTTP Proxy Server for Whitelisted Commands
 
-A lightweight HTTP proxy server that allows running commands from the PATH (or any configured path) through HTTP. It acts as a simple bridge between the client and a configured server, proxying arguments via a single JSON body to the target command.
+**shttp** is a lightweight HTTP proxy server that allows executing whitelisted commands from the PATH (or any configured path) through HTTP. It’s built in Node.js and designed for safe, sandboxed command execution over the network.
 
-## Features
+## Overview
 
-- **Command Proxying**: Run any command from the PATH (or custom path) via HTTP.
-- **Simple Bash Utility**: A CLI tool named `shttp` (written in sh) that uses `curl` to forward arguments and stdin to the configured server. The `shttp` utility exits with the same exit code as the command that ran and outputs stdout only.
-- **Whitelist Configuration**: Control which commands are allowed via an environment variable (`SHTTP_ALLOWED_COMMANDS`).
-- **HTTP Interface**: The server exposes a simple HTTP endpoint for command execution.
-- **Bash Function Export**: The server provides a `/bash` endpoint that outputs bash function definitions which can be sourced in a bash environment. Each function is named after an allowed command from `SHTTP_ALLOWED_COMMANDS`, and its body calls the `shttp` utility with the same command name.
-- **Aliases**: Define shell aliases to quickly proxy specific commands via HTTP.
+- **Protocol**: HTTP
+- **Methods**:
+  - `GET /bash` – Returns a Bash script with generated functions for each allowed command.
+  - `POST /` – Executes a command and returns its stdout, stderr, and exit code.
+- **Environment Variables**:
+  - `SHTTP_ENDPOINT` – Server endpoint URL, including port (default: `http://localhost:8080`). Note: `SHTTP_PORT` is no longer supported; use `SHTTP_ENDPOINT` to specify both host and port.
+  - `SHTTP_ALLOWED_COMMANDS` – Whitelist of commands (space‑ or comma‑separated, e.g. `"git curl wget python"`)
+- **Body format for POST /**: First line = JSON array of arguments, remaining bytes = stdin data.
 
-## Quick Start
+## Installation
 
-### 1. Configure Whitelisted Commands
-
-Set the `SHTTP_ALLOWED_COMMANDS` environment variable to a whitelist of commands that the proxy will allow:
-
-```bash
-export SHTTP_ALLOWED_COMMANDS="git curl wget python"
-```
-
-Only commands listed in `SHTTP_ALLOWED_COMMANDS` will be permitted.
-
-### 2. Start the Server
+Assuming you have Node.js installed:
 
 ```bash
-shttp
-```
-
-The server listens on port `SHTTP_PORT` (default: 8080). It expects a POST request with a raw string body like `git commit -m "Initial commit"`. It streams only **stdout** back; stderr is ignored in this version. Exit codes are returned to the client.
-
-> **Note**: For the **first version**, stdin support is deferred. The server accepts a raw string body like `git commit -m "Initial commit"` and streams **stdout** back. Exit codes are propagated back to the client correctly via `__EXIT_CODE__:N` marker.
-
-> **Note**: Standard error is not captured/streamed in the first version. Only standard output and the exit code are handled.
-
-### 3. Run a Command
-
-Send a POST request with a raw string body:
-
-```bash
-curl -X POST http://localhost:8080/ -H "Content-Type: text/plain" -d 'git commit -m "Initial commit"'
-```
-
-### 4. Source Bash Functions
-
-Source the exported bash functions to run allowed commands directly:
-
-```bash
-eval "$(curl -s http://localhost:8080/bash)"
-```
-
-Now you can run `git`, `curl`, `wget`, etc. directly as shell functions, which will proxy through the shttp server.
-
-## How It Works
-
-1. The `shttp` server listens on a configurable port (default: 8080).
-2. When a POST request is received with a raw string body like `git commit -m "Initial commit"`, the server splits it into the command and arguments.
-3. If the command is in the `SHTTP_ALLOWED_COMMANDS` whitelist, it is executed with the remaining arguments.
-4. The server streams **stdout** back to the client via HTTP response, and returns the command's exit code.
-5. For convenience, the server also provides a `/bash` endpoint that outputs bash function definitions which can be sourced in a bash environment. Each function is named after an allowed command from `SHTTP_ALLOWED_COMMANDS`, and its body calls the `shttp` utility with the same command name.
-
-## Configuration
-
-All environment variables use the `SHTTP_` prefix (matching the project name):
-
-### Allowed Commands
-
-The `SHTTP_ALLOWED_COMMANDS` environment variable defines a whitelist of commands that can be executed. Each command must be found on the system PATH.
-
-Example:
-```bash
-export SHTTP_ALLOWED_COMMANDS="git curl wget python"
-```
-
-### Server Port
-
-Change the port by setting the `SHTTP_PORT` environment variable:
-```bash
-export SHTTP_PORT=9000
-shttp
-```
-
-### Wrapper URL (rapper)
-
-Change the server URL by setting the `SHTTP_WRAPPER_URL` environment variable (default: `http://localhost:8080`):
-```bash
-export SHTTP_WRAPPER_URL="http://localhost:9000"
-shttp git commit -m "msg"
-```
-
-
-## Aliases
-
-You can define shell aliases to quickly proxy specific commands via HTTP. For example, to proxy `git`:
-
-```bash
-alias git='shttp git'
-```
-
-Now you can run `git commit -m "msg"` to proxy `git commit` through the server.
-
-## Bash Function Export
-
-The server also provides a `/bash` endpoint that outputs bash function definitions which can be sourced in a bash environment. Each function is named after an allowed command from `SHTTP_ALLOWED_COMMANDS`, and its body calls the `shttp` utility with the same command name:
-
-```bash
-function shttp { shttp "$@"; }
-function git { shttp git "$@"; }
-function curl { shttp curl "$@"; }
-function wget { shttp wget "$@"; }
-```
-
-To use this feature, source the output in your shell:
-
-```bash
-eval "$(curl -s http://localhost:8080/bash)"
-```
-
-Now you can run allowed commands directly as shell functions, which will proxy through the shttp server:
-
-```bash
-git commit -m "Initial commit"
-curl https://example.com/file.zip
-wget https://example.com/file.zip
-```
-
-The `/bash` endpoint is available at `GET /bash`. It respects the `SHTTP_ALLOWED_COMMANDS` whitelist - only listed commands will have functions generated.
-
-## Usage Examples
-
-| Example | Description |
-|---------|-------------|
-| ```bash
-curl -X POST http://localhost:8080/ -H "Content-Type: text/plain" -d 'git commit -m "msg"'
-``` | Execute `git commit` via the proxy |
-| ```bash
-curl -X POST http://localhost:8080/ -H "Content-Type: text/plain" -d 'wget https://example.com/file.zip'
-``` | Execute `wget` to download a file |
-| ```bash
-curl -X POST http://localhost:8080/ -H "Content-Type: text/plain" -d 'python -c "print(\"hello\")"'
-``` | Run a Python one-liner |
-| ```bash
-curl -X POST http://localhost:8080/ -H "Content-Type: text/plain" -d 'unknowncmd arg'
-``` | Attempt to run an unauthorized command (will be rejected) |
-| ```bash
-shttp git commit -m "msg"
-``` | Execute `git commit` via the shttp wrapper utility |
-
-## Security Notes
-
-- Only commands listed in `SHTTP_ALLOWED_COMMANDS` are permitted.
-- The server does not validate command arguments beyond the whitelist.
-- Be cautious when using this proxy with untrusted inputs.
-- The server runs commands in the current shell context; ensure the whitelist is comprehensive.
-
-## Development
-
-### Building
-
-The server is a simple script; ensure it is executable:
-
-```bash
+# Clone this repo (if applicable) or place the `shttp` script in your project.
+# Install the only dependency (`debug`).
+npm install
+# Make the executable script runnable (if needed).
 chmod +x shttp
 ```
 
-### Running Tests
+> **Note**: The `shttp` script is a Node.js program that uses the standard `#!/usr/bin/env node` shebang, so you can invoke it directly on Unix‑like systems.
+
+## Quick start
+
+### 1. Start the server
 
 ```bash
-# If you add tests, run them with the appropriate test runner
+# Example: allow only `git`, `curl`, and `python3`
+SHTTP_ALLOWED_COMMANDS="git curl python3" ./shttp
 ```
+
+The server will output debug messages (on the console) showing the endpoint, whitelist, and ready state.
+
+### 2. Generate a client script
+
+Open another terminal and request the Bash helper script:
+
+```bash
+curl -s http://localhost:8080/bash > shttp-client.sh
+```
+
+Make it executable and source it (or directly embed the generated functions):
+
+```bash
+chmod +x shttp-client.sh
+source shttp-client.sh
+```
+
+You should now have interactive Bash functions such as:
+
+```bash
+git() { shttp_client 'git' "$@"; }
+curl() { shttp_client 'curl' "$@"; }
+python() { shttp_client 'python' "$@"; }
+```
+
+### 3. Run a command
+
+Now you can call the allowed commands as if they were locally installed:
+
+```bash
+git --version
+curl -I https://example.com
+python -c "print('Hello from shttp!')"
+```
+
+Behind the scenes, each call:
+1. Builds a JSON argument array, e.g. `["git","--version"]`.
+2. Sends it as the first line of a POST request to `http://localhost:8080/` (or `${SHTTP_ENDPOINT}`). The remaining request body is any stdin data you’d like to feed (often empty).
+3. Receives the command’s stdout, stderr (base‑64 encoded), exit code, and any special flags (`X-SHTTP-Timeout`, `X-SHTTP-Output-Limit`, etc.) in the HTTP headers.
+4. Returns the stdout directly to your terminal, reproducing the command’s normal output.
+
+## Detailed usage
+
+### 3.1. Direct HTTP interaction
+
+If you prefer not to use the generated Bash script, you can talk to the server directly with `curl`. Remember that the body must start with a JSON array of arguments, and the rest is the stdin payload.
+
+**Example – run `git log --oneline -5` with empty stdin:**
+
+```bash
+cat <<'EOF' | curl -X POST http://localhost:8080/ -d @-
+["git","log","--oneline","-5"]
+EOF
+```
+
+**Example – feed a script to `python`:**
+
+```bash
+SCRIPT='print("Hello world")'
+PAYLOAD=$(printf '["python"]\n%s' "$SCRIPT")
+printf "%s" "$PAYLOAD" | curl -X POST http://localhost:8080/ -d @-
+```
+
+**Example – capture errors:**
+
+The server returns a `X-SHTTP-Stderr` header with base‑64 encoded stderr (truncated to 4 KB). If the command fails, the exit code is reflected in the `X-SHTTP-Exit-Code` header (e.g., `curl -w "%{x-shttp-exit-code}" ...`).
+
+### 3.2. Configuration
+
+- **Whitelist format**: any space or comma separated list. Invalid commands are silently ignored.
+- **Timeout**: commands are forcibly killed after 30 seconds (configurable via the code). The exit code becomes `1`.
+- **Output size limit**: maximum 5 MiB of combined stdout + stderr; exceeding this aborts the command.
+- **Body size limit**: maximum 10 MiB of request body; larger bodies are rejected with 413.
+
+### 3.3. Security considerations
+
+- Only commands listed in `SHTTP_ALLOWED_COMMANDS` are executable.
+- No additional environment variables or PATH manipulation is exposed to the child process beyond the current environment (the child inherits `process.env` but the whitelist check prevents arbitrary binaries).
+- The server does not grant shell access; commands are executed directly via `spawn` with `shell: false`.
+- All stderr is base‑64 encoded in headers to keep the HTTP body strictly binary‑safe.
+
+## Project structure
+
+```text
+/home/bashbot/shttp
+├── .git/                     # Git metadata
+├── .gitignore
+├── package.json            # Dependency and metadata
+├── package-lock.json
+├── node_modules/           # Installed packages (`debug`)
+├── shttp                    # Executable Node.js server script
+└── server.log              # Debug log from the server (if enabled)
+```
+
+## See also
+
+- [Node.js `child_process.spawn` documentation](https://nodejs.org/api/child_process.html#child_proces_spawn)
+- [`debug` module](https://github.com/debug-js/debug) – logging utility used internally.
 
 ## License
 
-MIT
+(Insert your preferred license here. For example, MIT.)
+
+## Feedback & Contributions
+
+Feel free to open issues or pull‑requests in the repository. Improvements to the whitelist logic, timeout handling, or additional client‑side helpers are always welcome.

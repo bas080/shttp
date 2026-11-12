@@ -4,7 +4,7 @@
 // Execute whitelisted commands from PATH via HTTP.
 //
 // Environment variables:
-//   SHTTP_ENDPOINT          Server endpoint (default: http://localhost:8080)
+//   SHTTP_ENDPOINT          Server endpoint (default: http://localhost:8080). The port is extracted from this URL.
 //   SHTTP_ALLOWED_COMMANDS  Whitelist (e.g. "git curl wget python")
 
 const http = require('http');
@@ -105,7 +105,7 @@ const server = http.createServer(async (req, res) => {
         continue;
       }
 
-      funcs.push(`${cmd}() {
+      funcs.push(`function ${cmd} {
   shttp_client '${cmd}' "$@"
 }`);
     }
@@ -279,6 +279,8 @@ async function readAndProcessRequest(req, res) {
   const separatorIndex = body.indexOf(0x0a);
 
   if (separatorIndex === -1) {
+    debug("Body length: %d", body.length);
+    debug("Body: %s", body.toString());
     res.writeHead(400, {
       'Content-Type': 'text/plain'
     });
